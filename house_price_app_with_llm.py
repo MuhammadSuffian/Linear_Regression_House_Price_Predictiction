@@ -4,7 +4,7 @@ import streamlit as st
 import requests
 import json
 import itertools
-from groq import Groq
+import groq
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="House Price Predictor", page_icon="🏠", layout="centered")
