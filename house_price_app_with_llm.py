@@ -1,10 +1,12 @@
 import pandas as pd
 import pickle
 import streamlit as st
-import requests
-import json
 import itertools
-from groq import Groq
+import re
+import asyncio
+from pydantic_ai import Agent
+from pydantic_ai.models.groq import GroqModel
+from pydantic_ai.providers.groq import GroqProvider
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="House Price Predictor", page_icon="🏠", layout="centered")
@@ -78,60 +80,17 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .badge-ok   { color: #34d399; font-size: 2rem; font-weight: 700; }
 .ai-box {
     background: rgba(255,255,255,0.03); border: 1px solid rgba(167,139,250,0.25);
-    border-radius: 12px; padding: 1.2rem; margin-top: 1rem;
-    color: #cbd5e1; font-size: 0.95rem; line-height: 1.7;
+    border-radius: 12px; padding: 1.4rem 1.6rem; margin-top: 1rem;
+    color: #cbd5e1; font-size: 0.92rem; line-height: 1.75;
 }
+.ai-box ul { list-style: none; padding-left: 0; }
+.ai-box li::before { content: "→ "; color: #a78bfa; font-weight: 600; }
+.ai-box b { color: #e2e8f0; }
+.ai-box p { margin: 0.3rem 0; }
 #MainMenu, footer, header { visibility: hidden; }
 .block-container { padding-top: 1rem !important; }
 </style>
 """, unsafe_allow_html=True)
-
-# ─── Format Advice ──────────────────────────────────────────────────────────────
-def format_advice(text: str) -> str:
-    """Convert markdown-style LLM output to clean HTML."""
-    import re
-    lines = text.strip().split('\n')
-    html_lines = []
-    in_list = False
- 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            if in_list:
-                html_lines.append('</ul>')
-                in_list = False
-            html_lines.append('<br>')
-            continue
- 
-        # Bullet points: lines starting with - or *
-        if re.match(r'^[-*]\s+', line):
-            if not in_list:
-                html_lines.append('<ul style="margin:0.6rem 0 0.6rem 1.2rem; padding:0;">')
-                in_list = True
-            content = re.sub(r'^[-*]\s+', '', line)
-            # Bold **text**
-            content = re.sub(r'\*\*(.*?)\*\*', r'<b style="color:#e2e8f0">\1</b>', content)
-            # Sub-bullets indented with spaces
-            html_lines.append(f'<li style="margin-bottom:0.4rem; color:#cbd5e1">{content}</li>')
-            continue
- 
-        # Close list if open
-        if in_list:
-            html_lines.append('</ul>')
-            in_list = False
- 
-        # Bold headers like **Header:**
-        line = re.sub(r'\*\*(.*?)\*\*', r'<b style="color:#e2e8f0">\1</b>', line)
-        # Numbered lines like "1. ..."
-        if re.match(r'^\d+\.\s+', line):
-            line = re.sub(r'^(\d+\.)\s+', r'<b style="color:#a78bfa">\1</b> ', line)
-        html_lines.append(f'<p style="margin:0.4rem 0; color:#cbd5e1">{line}</p>')
- 
-    if in_list:
-        html_lines.append('</ul>')
- 
-    return '\n'.join(html_lines)
- 
 
 # ─── Load Model ──────────────────────────────────────────────────────────────
 @st.cache_resource
@@ -159,27 +118,18 @@ def predict_price(params: dict) -> float:
     encoded  = encoded.reindex(columns=TRAIN_COLUMNS, fill_value=0)
     return model.predict(encoded)[0]
 
-# ─── Helper: Find cheapest combo under budget ────────────────────────────────
+# ─── Helper: Find cheapest combos under budget ───────────────────────────────
 def find_budget_combos(base_params: dict, budget: float):
-    """Try combinations of cheaper feature values and return best ones under budget."""
     yes_no_fields = ['mainroad','guestroom','basement','hotwaterheating','airconditioning','prefarea']
     furnishing_options = ['unfurnished', 'semi-furnished', 'furnished']
-
     cheaper_variants = []
-
-    # Try all combinations of yes/no fields being flipped to "no" + cheaper furnishing
     fields_currently_yes = [f for f in yes_no_fields if base_params.get(f) == 'yes']
-
-    # Try reducing area too (in steps of 500)
     area_options = [base_params['area']]
     if base_params['area'] > 1000:
         area_options = [base_params['area'], base_params['area'] - 500, base_params['area'] - 1000]
         area_options = [a for a in area_options if a >= 500]
-
     furnish_idx = furnishing_options.index(base_params['furnishingstatus'])
-    furnish_cheaper = furnishing_options[:furnish_idx + 1]  # same or cheaper
-
-    # Generate up to 8 meaningful variants
+    furnish_cheaper = furnishing_options[:furnish_idx + 1]
     for r in range(0, len(fields_currently_yes) + 1):
         for fields_to_flip in itertools.combinations(fields_currently_yes, r):
             for furnish in furnish_cheaper:
@@ -198,35 +148,82 @@ def find_budget_combos(base_params: dict, budget: float):
                             changes.append(f"furnishing: {base_params['furnishingstatus']} → {furnish}")
                         if area_val != base_params['area']:
                             changes.append(f"area: {base_params['area']} → {area_val} sq ft")
-                        cheaper_variants.append({
-                            "params": variant,
-                            "price": price,
-                            "changes": changes,
-                            "n_changes": len(changes)
-                        })
+                        cheaper_variants.append({"params": variant, "price": price,
+                                                  "changes": changes, "n_changes": len(changes)})
             if len(cheaper_variants) >= 20:
                 break
         if len(cheaper_variants) >= 20:
             break
-
-    # Sort by fewest changes, then cheapest
     cheaper_variants.sort(key=lambda x: (x['n_changes'], x['price']))
     return cheaper_variants[:5]
 
-def ask_groq(api_key: str, prompt: str) -> str:
-    client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[
-            {"role": "system", "content": "You are a helpful and friendly real estate advisor. Be concise, warm, and practical. Use bullet points where helpful."},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=500,
-        temperature=0.7
-    )
-    return response.choices[0].message.content
+# ─── Helper: Format Advice ───────────────────────────────────────────────────
+def format_advice(text: str) -> str:
+    lines = text.strip().split('\n')
+    html_lines = []
+    in_list = False
+    for line in lines:
+        line = line.strip()
+        if not line:
+            if in_list:
+                html_lines.append('</ul>')
+                in_list = False
+            html_lines.append('<br>')
+            continue
+        if re.match(r'^[-*]\s+', line):
+            if not in_list:
+                html_lines.append('<ul style="margin:0.6rem 0 0.6rem 1.2rem; padding:0;">')
+                in_list = True
+            content = re.sub(r'^[-*]\s+', '', line)
+            content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', content)
+            html_lines.append(f'<li style="margin-bottom:0.4rem;">{content}</li>')
+            continue
+        if in_list:
+            html_lines.append('</ul>')
+            in_list = False
+        line = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
+        if re.match(r'^\d+\.\s+', line):
+            line = re.sub(r'^(\d+\.)\s+', r'<b style="color:#a78bfa">\1</b> ', line)
+        html_lines.append(f'<p style="margin:0.4rem 0;">{line}</p>')
+    if in_list:
+        html_lines.append('</ul>')
+    return '\n'.join(html_lines)
 
-# ─── UI ──────────────────────────────────────────────────────────────────────
+# ─── Helper: Get pydantic-ai GroqModel (same as 2nd file) ────────────────────
+def get_groq_model():
+    try:
+        api_key = st.secrets["groq_clouds"].strip()
+    except KeyError:
+        st.error("Secret 'groq_clouds' not found. Add it in Streamlit Cloud → Settings → Secrets.")
+        return None
+    if not api_key:
+        st.error("Groq API key is empty. Check your Streamlit secrets.")
+        return None
+    try:
+        return GroqModel(
+            'llama-3.3-70b-versatile',
+            provider=GroqProvider(api_key=api_key)
+        )
+    except Exception as e:
+        st.error(f"Failed to initialise GroqModel: {repr(e)}")
+        return None
+
+# ─── Helper: Ask Groq via pydantic-ai Agent ──────────────────────────────────
+async def _ask_groq_async(prompt: str) -> str:
+    llm = get_groq_model()
+    if llm is None:
+        return "Model initialisation failed."
+    agent = Agent(
+        model=llm,
+        system_prompt="You are a helpful and friendly real estate advisor. Be concise, warm, and practical. Use bullet points where helpful."
+    )
+    result = await agent.run(prompt)
+    return result.output if hasattr(result, 'output') else str(result)
+
+def ask_groq(prompt: str) -> str:
+    return asyncio.run(_ask_groq_async(prompt))
+
+# ─── Hero ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="hero">
     <h1>🏠 House Price Predictor</h1>
@@ -237,9 +234,6 @@ st.markdown("""
 if not model_loaded:
     st.error("⚠️ `linear_model.pkl` not found. Place it in the same folder as this app.")
     st.stop()
-
-groq_key = st.secrets["groq_clouds"]
-st.markdown('</div>', unsafe_allow_html=True)
 
 # ─── Property Details ────────────────────────────────────────────────────────
 st.markdown('<div class="card"><div class="card-title">📐 Property Details</div>', unsafe_allow_html=True)
@@ -269,11 +263,11 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 # ─── Budget ───────────────────────────────────────────────────────────────────
 st.markdown('<div class="card"><div class="card-title">💰 Your Budget (Optional)</div>', unsafe_allow_html=True)
-budget = st.number_input("Budget (₨)", min_value=0, max_value=50000000, value=0, step=50000,
+budget = st.number_input("Budget ($)", min_value=0, max_value=50000000, value=0, step=50000,
                           help="Set to 0 to skip budget analysis")
 st.markdown('</div>', unsafe_allow_html=True)
 
-# ─── Predict Button ───────────────────────────────────────────────────────────
+# ─── Predict ──────────────────────────────────────────────────────────────────
 if st.button("🔮 Predict & Analyse"):
 
     base_params = {
@@ -286,18 +280,16 @@ if st.button("🔮 Predict & Analyse"):
 
     predicted_price = predict_price(base_params)
 
-    # ── Predicted Price ──
     st.markdown(f"""
     <div class="result-box">
         <div class="result-label">Estimated Property Value</div>
-        <div class="result-price">{predicted_price:,.0f} $</div>
+        <div class="result-price">$ {predicted_price:,.0f}</div>
         <div class="result-note">Based on Linear Regression model &middot; Estimates only</div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Budget Analysis ──
     if budget > 0:
-        diff = predicted_price - budget
+        diff     = predicted_price - budget
         over_pct = (diff / budget) * 100
 
         if predicted_price <= budget:
@@ -306,46 +298,42 @@ if st.button("🔮 Predict & Analyse"):
             <div class="budget-ok">
                 <div class="badge-ok">✅ Within Budget!</div>
                 <p style="color:#94a3b8; margin-top:0.5rem;">
-                    You're saving <b style="color:#34d399">&#8360; {saving:,.0f}</b>
+                    You're saving <b style="color:#34d399">$ {saving:,.0f}</b>
                     &nbsp;({abs(over_pct):.1f}% under budget)
                 </p>
             </div>
             """, unsafe_allow_html=True)
 
-            # Ask Groq for positive advice
-            if groq_key:
-                with st.spinner("🤖 Getting AI advice..."):
-                    prompt = f"""
-A buyer has a budget of ₨{budget:,.0f} and found a house predicted at ₨{predicted_price:,.0f}.
-House details: {area} sq ft, {bedrooms} beds, {bathrooms} baths, {stories} stories, {parking} parking.
+            with st.spinner("🤖 Getting AI advice..."):
+                prompt = f"""
+A buyer has a budget of ${budget:,.0f} and found a house predicted at ${predicted_price:,.0f}.
+House: {area} sq ft, {bedrooms} beds, {bathrooms} baths, {stories} stories, {parking} parking.
 Features: main road={mainroad}, guestroom={guestroom}, basement={basement},
 hot water={hotwaterheating}, AC={airconditioning}, preferred area={prefarea}, furnishing={furnishingstatus}.
-
-They are ₨{saving:,.0f} under budget ({abs(over_pct):.1f}%). Give them 3-4 short bullet points of advice:
+They are ${saving:,.0f} under budget ({abs(over_pct):.1f}%). Give 3-4 bullet points:
 - Confirm this is a good deal
 - What features make it valuable
-- How they might use the remaining budget (renovations, savings, etc.)
-Keep it friendly and encouraging. Currency is in Dollars
+- How to use the remaining budget (renovations, savings, etc.)
+Keep it friendly and encouraging. Currency is Dollars.
 """
-                    try:
-                        un_formatted_advice = ask_groq(groq_key, prompt)
-                        advice = format_advice(un_formatted_advice)
-                        st.markdown(f'<div class="ai-box"> <b>Expert Suggestion</b><br><br>{advice}</div>', unsafe_allow_html=True)
-                    except Exception as e:
-                        st.warning(f"AI advice unavailable: {e}")
+                try:
+                    raw     = ask_groq(prompt)
+                    formatted = format_advice(raw)
+                    st.markdown(f'<div class="ai-box"><p style="color:#a78bfa;font-weight:600;margin-bottom:0.8rem;">🤖 Expert Suggestion</p>{formatted}</div>', unsafe_allow_html=True)
+                except Exception as e:
+                    st.warning(f"AI advice unavailable: {e}")
 
         else:
             st.markdown(f"""
             <div class="budget-over">
                 <div class="badge-over">⚠️ Over Budget</div>
                 <p style="color:#94a3b8; margin-top:0.5rem;">
-                    Exceeds budget by <b style="color:#f87171">&#8360; {diff:,.0f}</b>
+                    Exceeds budget by <b style="color:#f87171">$ {diff:,.0f}</b>
                     &nbsp;({over_pct:.1f}% over)
                 </p>
             </div>
             """, unsafe_allow_html=True)
 
-            # Find cheaper alternatives
             with st.spinner("🔍 Finding alternatives within your budget..."):
                 alternatives = find_budget_combos(base_params, budget)
 
@@ -355,43 +343,35 @@ Keep it friendly and encouraging. Currency is in Dollars
                     change_text = ", ".join(alt['changes']) if alt['changes'] else "No changes needed"
                     st.markdown(f"""
                     <div class="card">
-                        <div class="card-title">Option {i} &mdash; &#8360; {alt['price']:,.0f}</div>
+                        <div class="card-title">Option {i} &mdash; $ {alt['price']:,.0f}</div>
                         <p style="color:#94a3b8; font-size:0.9rem;">Changes: <span style="color:#a78bfa">{change_text}</span></p>
-                        <p style="color:#34d399; font-size:0.85rem;">Saves &#8360; {predicted_price - alt['price']:,.0f} from original estimate</p>
+                        <p style="color:#34d399; font-size:0.85rem;">Saves $ {predicted_price - alt['price']:,.0f} from original estimate</p>
                     </div>
                     """, unsafe_allow_html=True)
 
-                # Ask Groq for advice with alternatives
-                if groq_key:
-                    with st.spinner("🤖 Getting AI advice..."):
-                        alt_summaries = "\n".join([
-                            f"Option {i+1}: ₨{a['price']:,.0f} — changes: {', '.join(a['changes']) or 'minimal'}"
-                            for i, a in enumerate(alternatives[:3])
-                        ])
-                        prompt = f"""
-A buyer has a budget of ₨{budget:,.0f} but the house they want is predicted at ₨{predicted_price:,.0f} (over by ₨{diff:,.0f}).
-Original house: {area} sq ft, {bedrooms} beds, {bathrooms} baths, furnishing={furnishingstatus},
+                with st.spinner("🤖 Getting AI advice..."):
+                    alt_summaries = "\n".join([
+                        f"Option {i+1}: ${a['price']:,.0f} — changes: {', '.join(a['changes']) or 'minimal'}"
+                        for i, a in enumerate(alternatives[:3])
+                    ])
+                    prompt = f"""
+A buyer has a budget of ${budget:,.0f} but the house costs ${predicted_price:,.0f} (over by ${diff:,.0f}).
+Original: {area} sq ft, {bedrooms} beds, {bathrooms} baths, furnishing={furnishingstatus},
 AC={airconditioning}, preferred area={prefarea}, main road={mainroad}.
-
-Here are cheaper alternatives found by adjusting features:
+Cheaper alternatives:
 {alt_summaries}
-
-Give them 4-5 bullet points of practical advice:
-- Acknowledge the budget challenge empathetically
-- Which option is the best trade-off and why
-- Which features are worth keeping vs dropping
-- Any negotiation or timing tips
-Be friendly, specific, and helpful.
+Give 4-5 bullet points: acknowledge the challenge, best trade-off option, features to keep vs drop, negotiation tips.
+Be friendly and helpful. Currency is Dollars.
 """
-                        try:
-                            advice = ask_groq(groq_key, prompt)
-                            st.markdown(f'<div class="ai-box">🤖 <b>AI Advisor</b><br><br>{advice}</div>', unsafe_allow_html=True)
-                        except Exception as e:
-                            st.warning(f"AI advice unavailable: {e}")
+                    try:
+                        raw       = ask_groq(prompt)
+                        formatted = format_advice(raw)
+                        st.markdown(f'<div class="ai-box"><p style="color:#a78bfa;font-weight:600;margin-bottom:0.8rem;">🤖 Expert Suggestion</p>{formatted}</div>', unsafe_allow_html=True)
+                    except Exception as e:
+                        st.warning(f"AI advice unavailable: {e}")
             else:
-                st.warning("No combinations found within your budget. Consider increasing your budget or reducing area/stories.")
+                st.warning("No combinations found within your budget. Consider increasing budget or reducing area/stories.")
 
-    # ── Input Summary ──
     with st.expander("📋 View Input Summary"):
         summary = {
             "Area (sq ft)": area, "Bedrooms": bedrooms, "Bathrooms": bathrooms,
@@ -403,4 +383,3 @@ Be friendly, specific, and helpful.
         }
         st.dataframe(pd.DataFrame(summary.items(), columns=["Feature", "Value"]),
                      use_container_width=True, hide_index=True)
-        
