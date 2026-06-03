@@ -3,10 +3,7 @@ import pickle
 import streamlit as st
 import itertools
 import re
-import asyncio
-from pydantic_ai import Agent
-from pydantic_ai.models.groq import GroqModel
-from pydantic_ai.providers.groq import GroqProvider
+from groq import Groq
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="House Price Predictor", page_icon="🏠", layout="centered")
@@ -189,39 +186,32 @@ def format_advice(text: str) -> str:
         html_lines.append('</ul>')
     return '\n'.join(html_lines)
 
-# ─── Helper: Get pydantic-ai GroqModel (same as 2nd file) ────────────────────
-def get_groq_model():
+# ─── Helper: Ask Groq ────────────────────────────────────────────────────────
+def ask_groq(prompt: str) -> str:
     try:
         api_key = st.secrets["groq_clouds"].strip()
     except KeyError:
         st.error("Secret 'groq_clouds' not found. Add it in Streamlit Cloud → Settings → Secrets.")
-        return None
+        return ""
     if not api_key:
         st.error("Groq API key is empty. Check your Streamlit secrets.")
-        return None
-    try:
-        return GroqModel(
-            'llama-3.3-70b-versatile',
-            provider=GroqProvider(api_key=api_key)
-        )
-    except Exception as e:
-        st.error(f"Failed to initialise GroqModel: {repr(e)}")
-        return None
-
-# ─── Helper: Ask Groq via pydantic-ai Agent ──────────────────────────────────
-async def _ask_groq_async(prompt: str) -> str:
-    llm = get_groq_model()
-    if llm is None:
-        return "Model initialisation failed."
-    agent = Agent(
-        model=llm,
-        system_prompt="You are a helpful and friendly real estate advisor. Be concise, warm, and practical. Use bullet points where helpful."
+        return ""
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful and friendly real estate advisor. Be concise, warm, and practical. Use bullet points where helpful."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        max_tokens=1000
     )
-    result = await agent.run(prompt)
-    return result.output if hasattr(result, 'output') else str(result)
-
-def ask_groq(prompt: str) -> str:
-    return asyncio.run(_ask_groq_async(prompt))
+    return response.choices[0].message.content
 
 # ─── Hero ─────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -317,7 +307,7 @@ They are ${saving:,.0f} under budget ({abs(over_pct):.1f}%). Give 3-4 bullet poi
 Keep it friendly and encouraging. Currency is Dollars.
 """
                 try:
-                    raw     = ask_groq(prompt)
+                    raw       = ask_groq(prompt)
                     formatted = format_advice(raw)
                     st.markdown(f'<div class="ai-box"><p style="color:#a78bfa;font-weight:600;margin-bottom:0.8rem;">🤖 Expert Suggestion</p>{formatted}</div>', unsafe_allow_html=True)
                 except Exception as e:
