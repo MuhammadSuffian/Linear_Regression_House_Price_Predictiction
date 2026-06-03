@@ -8,7 +8,7 @@ altair
 streamlit-folium
 folium
 urllib3
-pydantic-ai==0.0.14
+pydantic_ai==0.0.14
 svglib
 plotly
 streamlit-option-menu
