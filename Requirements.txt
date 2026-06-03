@@ -5,13 +5,10 @@ scikit-learn
 reportlab
 groq
 altair
-smolagents
 streamlit-folium
 folium
 urllib3
-asyncio
-pydantic-ai
-datetime
+pydantic-ai==0.0.14
 svglib
 plotly
 streamlit-option-menu
