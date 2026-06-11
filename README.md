@@ -62,4 +62,4 @@ This project started as a coursework machine learning model and evolved into a c
 
 ## Author
 
-**Muhammad Suffian**
+**Muhammad Suffian Tafoor**
