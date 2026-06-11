@@ -54,7 +54,7 @@ streamlit run app.py
 
 ## Live Demo
 
-Live Application: https://lnkd.in/dZfMRy74
+Live Application: [https://lnkd.in/dZfMRy74](https://muhammadsuffian-linear-regressi-house-price-app-with-llm-loohfa.streamlit.app/)
 
 ## Key Takeaway
 
